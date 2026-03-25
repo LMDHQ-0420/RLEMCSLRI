@@ -114,9 +114,9 @@ def save_metadata_only(results, base_path):
 
 if __name__ == "__main__":
     BASE_PATH = "data/ECT-Logic"
-    TOTAL_SAMPLES = 1,000,000 
-    BATCH_SIZE = 5,000       
-    SAVE_BLOCK_SIZE = 100,000 # 内存缓冲区大小
+    TOTAL_SAMPLES = 1000000 
+    BATCH_SIZE = 5000       
+    SAVE_BLOCK_SIZE = 100000 # 内存缓冲区大小
     NUM_CORES = 32
     
     os.makedirs(BASE_PATH, exist_ok=True)
