@@ -8,14 +8,14 @@ import os
 import csv
 import glob
 import networkx as nx
-from datasets import Dataset, concatenate_datasets  # 核心：引入合并功能
+from datasets import Dataset, concatenate_datasets, load_from_disk
 
 # ==========================================
-# 1. 核心算法 (保持不变，已补全注释)
+# 1. 核心算法 (逻辑生成与图构建)
 # ==========================================
 
 def generate_logic_params_minimal(mu_h, sigma_h, mu_t, sigma_t):
-    """采样并微调逻辑参数，确保 d >= 2 防止数学错误"""
+    """采样并微调逻辑参数，确保 d >= 2"""
     target_h = max(2.0, np.random.normal(mu_h, sigma_h))
     target_t = max(target_h * 3.0, np.random.normal(mu_t, sigma_t))
     target_m = int(target_t // 2) 
@@ -82,17 +82,15 @@ def construct_and_map(h_params, all_token_ids):
     return {"h": round(final_h, 2), "t": final_t, "l": L, "d_seq": str(d_seq), "q": q_content, "a": a_content, "hash": topo_hash}
 
 # ==========================================
-# 2. 存储与任务分配
+# 2. 存储辅助函数
 # ==========================================
 
 def worker_task(args):
-    """多进程单个样本生成任务"""
     mu_h, sigma_h, mu_t, sigma_t, all_token_ids = args
     params = generate_logic_params_minimal(mu_h, sigma_h, mu_t, sigma_t)
     return construct_and_map(params, all_token_ids)
 
 def save_metadata_only(results, base_path):
-    """全量元数据 CSV 持久化，用于最后的汇总绘图"""
     csv_dir = os.path.join(base_path, "metadata")
     os.makedirs(csv_dir, exist_ok=True)
     opened_files = {}
@@ -109,19 +107,20 @@ def save_metadata_only(results, base_path):
     for f, _ in opened_files.values(): f.close()
 
 # ==========================================
-# 3. 主程序：高效存储逻辑
+# 3. 主程序
 # ==========================================
 
 if __name__ == "__main__":
     BASE_PATH = "data/ECT-Logic"
     TOTAL_SAMPLES = 1000000 
     BATCH_SIZE = 5000       
-    SAVE_BLOCK_SIZE = 100000 # 内存缓冲区大小
+    SAVE_BLOCK_SIZE = 100000 # 缓冲区大小
     NUM_CORES = 32
     
     os.makedirs(BASE_PATH, exist_ok=True)
     all_token_ids = list(range(50257))
     
+    # 彻底禁用 HF 进度条输出
     import datasets
     datasets.utils.logging.set_verbosity_error()
     datasets.disable_progress_bar()
@@ -129,12 +128,10 @@ if __name__ == "__main__":
     manager = Manager()
     global_hashes = manager.dict()
     
-    # 用于存放各阶段生成的临时 Dataset 对象
-    dataset_list = [] 
     full_data_buffer = {"q": [], "a": []}
     generated_count = 0
     
-    print(f"\n>>> 启动大规模逻辑生成系统 [目标: {TOTAL_SAMPLES}]")
+    print(f"\n>>> 启动生成系统 [目标: {TOTAL_SAMPLES}]")
     
     with Pool(NUM_CORES) as pool:
         while generated_count < TOTAL_SAMPLES:
@@ -149,62 +146,77 @@ if __name__ == "__main__":
                     full_data_buffer["q"].append(item['q'])
                     full_data_buffer["a"].append(item['a'])
             
-            # 实时保存元数据 CSV
             save_metadata_only(unique_batch, BASE_PATH)
-            
             generated_count += len(unique_batch)
-            print(f"进度: {generated_count}/{TOTAL_SAMPLES} | 当前有效率: {len(unique_batch)/BATCH_SIZE*100:.1f}%")
+            
+            efficiency = (len(unique_batch)/BATCH_SIZE)*100
+            print(f"进度: {generated_count}/{TOTAL_SAMPLES} | 有效率: {efficiency:.1f}%")
 
-            # 当缓冲区满时，直接落盘为一个独立的分片文件夹
+            # --- 每 10 万条存一个文件夹 ---
             if len(full_data_buffer["q"]) >= SAVE_BLOCK_SIZE or generated_count >= TOTAL_SAMPLES:
-                # 计算当前分片编号
-                shard_idx = (generated_count - 1) // SAVE_BLOCK_SIZE
-                shard_path = os.path.join(BASE_PATH, "hf_shards", f"shard_{shard_idx}")
+                if len(full_data_buffer["q"]) > 0:
+                    # 分片 ID
+                    shard_id = generated_count // SAVE_BLOCK_SIZE
+                    shard_path = os.path.join(BASE_PATH, "hf_shards", f"shard_{shard_id}")
+                    
+                    # 每一个文件夹都是一个标准的数据集分片
+                    Dataset.from_dict(full_data_buffer).save_to_disk(shard_path)
+                    print(f"--- 成功生成标准数据集分片: {shard_path} ---")
                 
-                # 立即写入磁盘，这样你就能立刻看到 arrow 文件了
-                Dataset.from_dict(full_data_buffer).save_to_disk(shard_path)
-                
-                print(f"--- 分片 {shard_idx} 已持久化至磁盘: {shard_path} ---")
-                
-                # 清空缓冲区，释放内存
                 full_data_buffer = {"q": [], "a": []}
 
-    # 核心步骤：合并所有数据集并统一分片存储
-    print("\n>>> 正在合并全量数据并执行 500MB 自动分片持久化...")
-    final_dataset = concatenate_datasets(dataset_list)
-    final_save_path = os.path.join(BASE_PATH, "hf_dataset_final")
+    # 删掉后面所有的 concatenate_datasets 逻辑
+    print("\n>>> 生成阶段全部完成。")
+
+    # --- 关键修复：从磁盘加载所有分片进行最终合并 ---
+    print("\n>>> 正在扫描磁盘分片并执行最终合并...")
+    shard_dirs = sorted(glob.glob(os.path.join(BASE_PATH, "hf_shards/shard_*")))
     
-    # 这里会生成一个干净的文件夹，里面自动按 500MB 切分为多个 arrow 文件
-    final_dataset.save_to_disk(final_save_path, max_shard_size="500MB")
-    print(f">>> 数据集已保存至: {final_save_path}")
+    if shard_dirs:
+        # 逐个加载已落盘的分片
+        loaded_datasets = [load_from_disk(d) for d in shard_dirs]
+        final_dataset = concatenate_datasets(loaded_datasets)
+        
+        final_save_path = os.path.join(BASE_PATH, "hf_dataset_final")
+        # 自动分片保存（生成整洁的多个 arrow 文件）
+        final_dataset.save_to_disk(final_save_path, max_shard_size="500MB")
+        print(f">>> 数据已整合至: {final_save_path}")
+    else:
+        print(">>> 错误：未发现可合并的分片文件。")
 
     # ==========================================
-    # 4. 绘图 (从 CSV 全量读取)
+    # 4. 绘图部分 (全量分析)
     # ==========================================
-    print("\n>>> 正在从 CSV 汇总全量数据并绘图...")
+    print("\n>>> 正在从 CSV 汇总数据并绘图...")
     csv_files = glob.glob(os.path.join(BASE_PATH, "metadata/H*.csv"))
-    all_h, all_t, all_l = [], [], []
-    for f_path in csv_files:
-        with open(f_path, 'r') as f_in:
-            reader = csv.DictReader(f_in)
-            for row in reader:
-                all_h.append(float(row['final_h'])); all_t.append(int(row['final_t'])); all_l.append(int(row['L']))
-    
-    plt.figure(figsize=(20, 6))
-    plt.subplot(1, 3, 1)
-    plt.hist(all_h, bins=50, density=True, color='#2ecc71', alpha=0.7, edgecolor='black')
-    mu_h, std_h = norm.fit(all_h); x_h = np.linspace(min(all_h), max(all_h), 100)
-    plt.plot(x_h, norm.pdf(x_h, mu_h, std_h), 'r--', lw=2); plt.title(f'H (Entropy)\nmu={mu_h:.2f}')
+    if not csv_files:
+        print(">>> 未发现元数据 CSV，跳过绘图。")
+    else:
+        all_h, all_t, all_l = [], [], []
+        for f_path in csv_files:
+            with open(f_path, 'r') as f_in:
+                reader = csv.DictReader(f_in)
+                for row in reader:
+                    all_h.append(float(row['final_h']))
+                    all_t.append(int(row['final_t']))
+                    all_l.append(int(row['L']))
+        
+        plt.figure(figsize=(20, 6))
+        # 子图逻辑保持一致
+        plt.subplot(1, 3, 1)
+        plt.hist(all_h, bins=50, density=True, color='#2ecc71', alpha=0.7, edgecolor='black')
+        mu, std = norm.fit(all_h); x = np.linspace(min(all_h), max(all_h), 100)
+        plt.plot(x, norm.pdf(x, mu, std), 'r--', lw=2); plt.title(f'H (Entropy)\nmu={mu:.2f}')
 
-    plt.subplot(1, 3, 2)
-    plt.hist(all_t, bins=50, density=True, color='#3498db', alpha=0.7, edgecolor='black')
-    mu_t, std_t = norm.fit(all_t); x_t = np.linspace(min(all_t), max(all_t), 100)
-    plt.plot(x_t, norm.pdf(x_t, mu_t, std_t), 'r--', lw=2); plt.title(f'T (Tokens)\nmu={mu_t:.2f}')
+        plt.subplot(1, 3, 2)
+        plt.hist(all_t, bins=50, density=True, color='#3498db', alpha=0.7, edgecolor='black')
+        mu, std = norm.fit(all_t); x = np.linspace(min(all_t), max(all_t), 100)
+        plt.plot(x, norm.pdf(x, mu, std), 'r--', lw=2); plt.title(f'T (Tokens)\nmu={mu:.2f}')
 
-    plt.subplot(1, 3, 3)
-    plt.hist(all_l, bins=range(min(all_l), max(all_l)+2), color='#f39c12', alpha=0.7, edgecolor='black', align='left')
-    plt.title(f'L (Depth)\nRange: {min(all_l)}-{max(all_l)}')
+        plt.subplot(1, 3, 3)
+        plt.hist(all_l, bins=range(min(all_l), max(all_l)+2), color='#f39c12', alpha=0.7, edgecolor='black', align='left')
+        plt.title(f'L (Depth)\nRange: {min(all_l)}-{max(all_l)}')
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(BASE_PATH, "final_dataset_stats.png"))
-    print(f">>> 任务圆满完成。")
+        plt.tight_layout()
+        plt.savefig(os.path.join(BASE_PATH, "final_dataset_stats.png"))
+        print(f">>> 任务圆满完成。图表已保存。")
