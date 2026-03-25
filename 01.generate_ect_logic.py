@@ -114,13 +114,12 @@ if __name__ == "__main__":
     BASE_PATH = "data/ECT-Logic"
     TOTAL_SAMPLES = 1000000 
     BATCH_SIZE = 5000       
-    SAVE_BLOCK_SIZE = 100000 # 缓冲区大小
+    SAVE_BLOCK_SIZE = 100000 # 满10万条保存一个文件夹
     NUM_CORES = 32
     
     os.makedirs(BASE_PATH, exist_ok=True)
     all_token_ids = list(range(50257))
     
-    # 彻底禁用 HF 进度条输出
     import datasets
     datasets.utils.logging.set_verbosity_error()
     datasets.disable_progress_bar()
@@ -130,6 +129,7 @@ if __name__ == "__main__":
     
     full_data_buffer = {"q": [], "a": []}
     generated_count = 0
+    shard_count = 0 # 用于给文件夹编号
     
     print(f"\n>>> 启动生成系统 [目标: {TOTAL_SAMPLES}]")
     
@@ -152,37 +152,23 @@ if __name__ == "__main__":
             efficiency = (len(unique_batch)/BATCH_SIZE)*100
             print(f"进度: {generated_count}/{TOTAL_SAMPLES} | 有效率: {efficiency:.1f}%")
 
-            # --- 每 10 万条存一个文件夹 ---
-            if len(full_data_buffer["q"]) >= SAVE_BLOCK_SIZE or generated_count >= TOTAL_SAMPLES:
-                if len(full_data_buffer["q"]) > 0:
-                    # 分片 ID
-                    shard_id = generated_count // SAVE_BLOCK_SIZE
-                    shard_path = os.path.join(BASE_PATH, "hf_shards", f"shard_{shard_id}")
-                    
-                    # 每一个文件夹都是一个标准的数据集分片
-                    Dataset.from_dict(full_data_buffer).save_to_disk(shard_path)
-                    print(f"--- 成功生成标准数据集分片: {shard_path} ---")
+            # --- 核心逻辑：满足 SAVE_BLOCK_SIZE 就存一个文件夹 ---
+            if len(full_data_buffer["q"]) >= SAVE_BLOCK_SIZE:
+                shard_path = os.path.join(BASE_PATH, "hf_shards", f"shard_{shard_count}")
+                Dataset.from_dict(full_data_buffer).save_to_disk(shard_path)
+                print(f"--- [落盘成功] 分片 {shard_count} 已保存至: {shard_path} ---")
                 
+                # 重置缓冲区和计数器
                 full_data_buffer = {"q": [], "a": []}
+                shard_count += 1
 
-    # 删掉后面所有的 concatenate_datasets 逻辑
-    print("\n>>> 生成阶段全部完成。")
+        # --- 循环结束后，保存最后一批不足 10 万条的数据 ---
+        if len(full_data_buffer["q"]) > 0:
+            shard_path = os.path.join(BASE_PATH, "hf_shards", f"shard_{shard_count}")
+            Dataset.from_dict(full_data_buffer).save_to_disk(shard_path)
+            print(f"--- [任务结束] 剩余数据已保存至: {shard_path} ---")
 
-    # --- 关键修复：从磁盘加载所有分片进行最终合并 ---
-    print("\n>>> 正在扫描磁盘分片并执行最终合并...")
-    shard_dirs = sorted(glob.glob(os.path.join(BASE_PATH, "hf_shards/shard_*")))
-    
-    if shard_dirs:
-        # 逐个加载已落盘的分片
-        loaded_datasets = [load_from_disk(d) for d in shard_dirs]
-        final_dataset = concatenate_datasets(loaded_datasets)
-        
-        final_save_path = os.path.join(BASE_PATH, "hf_dataset_final")
-        # 自动分片保存（生成整洁的多个 arrow 文件）
-        final_dataset.save_to_disk(final_save_path, max_shard_size="500MB")
-        print(f">>> 数据已整合至: {final_save_path}")
-    else:
-        print(">>> 错误：未发现可合并的分片文件。")
+    print("\n>>> 生成阶段圆满完成。所有分片已独立存放于 hf_shards/ 目录下。")
 
     # ==========================================
     # 4. 绘图部分 (全量分析)
@@ -202,7 +188,6 @@ if __name__ == "__main__":
                     all_l.append(int(row['L']))
         
         plt.figure(figsize=(20, 6))
-        # 子图逻辑保持一致
         plt.subplot(1, 3, 1)
         plt.hist(all_h, bins=50, density=True, color='#2ecc71', alpha=0.7, edgecolor='black')
         mu, std = norm.fit(all_h); x = np.linspace(min(all_h), max(all_h), 100)
@@ -219,4 +204,4 @@ if __name__ == "__main__":
 
         plt.tight_layout()
         plt.savefig(os.path.join(BASE_PATH, "final_dataset_stats.png"))
-        print(f">>> 任务圆满完成。图表已保存。")
+        print(f">>> 统计图表已保存至: {os.path.join(BASE_PATH, 'final_dataset_stats.png')}")
