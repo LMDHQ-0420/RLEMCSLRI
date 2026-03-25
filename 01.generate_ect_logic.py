@@ -118,7 +118,7 @@ if __name__ == "__main__":
     NUM_CORES = 32
     
     os.makedirs(BASE_PATH, exist_ok=True)
-    all_token_ids = list(range(50257))
+    all_token_ids = list(range(2048))
     
     import datasets
     datasets.utils.logging.set_verbosity_error()
