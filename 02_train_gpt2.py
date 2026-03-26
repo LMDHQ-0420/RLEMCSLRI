@@ -59,44 +59,61 @@ def preprocess_function(examples):
     return {"input_ids": inputs, "labels": labels, "h": examples["h"]}
 
 # ==========================================
-# 3. 自定义 Trainer：完全静默并写入 CSV
+# 3. 自定义 Trainer：增加 QA 和 Token 计数
 # ==========================================
 class SilentEntropyTrainer(Trainer):
     def __init__(self, *args, eval_entropy_interval=100000, csv_dir=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.eval_entropy_interval = eval_entropy_interval
         self.csv_dir = csv_dir
+        
+        # 核心计数器
         self.cumulative_entropy = 0.0
+        self.cumulative_qa = 0          # 已训练的 QA 总数
+        self.cumulative_tokens = 0      # 已训练的有效 Token 总数 (不含 padding)
+        
         self.last_eval_at = 0.0
 
     def training_step(self, model, inputs, *args, **kwargs):
+        # 1. 统计逻辑熵
         batch_h = inputs.pop("h", None)
         if batch_h is not None:
             self.cumulative_entropy += batch_h.sum().item()
         
+        # 2. 统计 QA 数量 (Batch Size)
+        self.cumulative_qa += inputs["input_ids"].size(0)
+        
+        # 3. 统计有效 Token 数量
+        # labels 中 -100 代表 padding 或不需要计算 loss 的部分
+        # inputs["input_ids"] 中非 0 (pad_token_id) 的部分为有效 token
+        # 这里建议统计 input_ids 中非 pad 的数量，即实际喂入模型的 token 数
+        valid_tokens = (inputs["input_ids"] != 0).sum().item()
+        self.cumulative_tokens += valid_tokens
+        
         loss = super().training_step(model, inputs, *args, **kwargs)
         
+        # 检查是否达到评估间隔
         if self.cumulative_entropy - self.last_eval_at >= self.eval_entropy_interval:
             self.evaluate()
             self.last_eval_at = self.cumulative_entropy
         return loss
 
     def log(self, logs):
-        # 屏蔽所有标准的控制台日志输出 (Loss, Steps等)，只保留进度条更新所需逻辑
         pass
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        # 调用原生评估（这会遍历 eval_datasets 字典）
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
         
-        # 自动识别并保存所有 L 分片结果
         for key, value in metrics.items():
             if "loss" in key and key != f"{metric_key_prefix}_loss":
                 shard_name = key.replace(f"{metric_key_prefix}_", "").replace("_loss", "")
                 csv_path = os.path.join(self.csv_dir, f"{shard_name}.csv")
                 
+                # 在 DataFrame 中增加两列
                 new_data = pd.DataFrame([{
                     "cumulative_entropy": self.cumulative_entropy,
+                    "cumulative_qa": self.cumulative_qa,         # 新增列
+                    "cumulative_tokens": self.cumulative_tokens, # 新增列
                     "eval_loss": value,
                     "eval_bits": value / np.log(2),
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
