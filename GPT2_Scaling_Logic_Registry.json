@@ -1,0 +1,179 @@
+{
+  "gpt2_scaling_configs": {
+    "246.8K": {
+      "n_layer": 1,
+      "n_embd": 64,
+      "n_head": 2,
+      "n_positions": 1024
+    },
+    "790.1K": {
+      "n_layer": 2,
+      "n_embd": 128,
+      "n_head": 4,
+      "n_positions": 1024
+    },
+    "1.19M": {
+      "n_layer": 4,
+      "n_embd": 128,
+      "n_head": 4,
+      "n_positions": 1024
+    },
+    "1.73M": {
+      "n_layer": 4,
+      "n_embd": 160,
+      "n_head": 4,
+      "n_positions": 1024
+    },
+    "2.35M": {
+      "n_layer": 6,
+      "n_embd": 160,
+      "n_head": 4,
+      "n_positions": 1024
+    },
+    "3.26M": {
+      "n_layer": 6,
+      "n_embd": 192,
+      "n_head": 6,
+      "n_positions": 1024
+    },
+    "4.15M": {
+      "n_layer": 8,
+      "n_embd": 192,
+      "n_head": 6,
+      "n_positions": 1024
+    },
+    "4.90M": {
+      "n_layer": 6,
+      "n_embd": 240,
+      "n_head": 8,
+      "n_positions": 1024
+    },
+    "6.29M": {
+      "n_layer": 8,
+      "n_embd": 240,
+      "n_head": 8,
+      "n_positions": 1024
+    },
+    "11.83M": {
+      "n_layer": 6,
+      "n_embd": 384,
+      "n_head": 8,
+      "n_positions": 1024
+    },
+    "18.93M": {
+      "n_layer": 10,
+      "n_embd": 384,
+      "n_head": 8,
+      "n_positions": 1024
+    },
+    "23.64M": {
+      "n_layer": 8,
+      "n_embd": 480,
+      "n_head": 10,
+      "n_positions": 1024
+    },
+    "29.19M": {
+      "n_layer": 10,
+      "n_embd": 480,
+      "n_head": 10,
+      "n_positions": 1024
+    },
+    "34.73M": {
+      "n_layer": 12,
+      "n_embd": 480,
+      "n_head": 12,
+      "n_positions": 1024
+    },
+    "41.66M": {
+      "n_layer": 10,
+      "n_embd": 576,
+      "n_head": 12,
+      "n_positions": 1024
+    },
+    "49.64M": {
+      "n_layer": 12,
+      "n_embd": 576,
+      "n_head": 12,
+      "n_positions": 1024
+    },
+    "76.98M": {
+      "n_layer": 12,
+      "n_embd": 720,
+      "n_head": 12,
+      "n_positions": 1024
+    },
+    "104.32M": {
+      "n_layer": 12,
+      "n_embd": 840,
+      "n_head": 14,
+      "n_positions": 1024
+    },
+    "154.30M": {
+      "n_layer": 12,
+      "n_embd": 1024,
+      "n_head": 16,
+      "n_positions": 1024
+    },
+    "204.69M": {
+      "n_layer": 16,
+      "n_embd": 1024,
+      "n_head": 16,
+      "n_positions": 1024
+    },
+    "304.79M": {
+      "n_layer": 20,
+      "n_embd": 1120,
+      "n_head": 16,
+      "n_positions": 1024
+    },
+    "407.74M": {
+      "n_layer": 24,
+      "n_embd": 1184,
+      "n_head": 16,
+      "n_positions": 1024
+    },
+    "500.19M": {
+      "n_layer": 24,
+      "n_embd": 1312,
+      "n_head": 16,
+      "n_positions": 1024
+    },
+    "623.33M": {
+      "n_layer": 26,
+      "n_embd": 1408,
+      "n_head": 22,
+      "n_positions": 1024
+    },
+    "751.49M": {
+      "n_layer": 30,
+      "n_embd": 1440,
+      "n_head": 24,
+      "n_positions": 1024
+    },
+    "851.09M": {
+      "n_layer": 34,
+      "n_embd": 1440,
+      "n_head": 24,
+      "n_positions": 1024
+    },
+    "1.02B": {
+      "n_layer": 36,
+      "n_embd": 1536,
+      "n_head": 24,
+      "n_positions": 1024
+    },
+    "1.48B": {
+      "n_layer": 48,
+      "n_embd": 1600,
+      "n_head": 25,
+      "n_positions": 1024
+    }
+  },
+  "global_settings": {
+    "vocab_size": 2049,
+    "resid_pdrop": 0.0,
+    "embd_pdrop": 0.0,
+    "attn_pdrop": 0.0,
+    "capacity_metric": "3.6 bits-per-parameter"
+  }
+}
