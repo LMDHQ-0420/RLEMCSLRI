@@ -59,7 +59,7 @@ def preprocess_function(examples):
     return {"input_ids": inputs, "labels": labels, "h": examples["h"]}
 
 # ==========================================
-# 3. 自定义 Trainer：增加 QA 和 Token 计数
+# 3. 自定义 Trainer：增加 Acc、QA 和 Token 计数
 # ==========================================
 class SilentEntropyTrainer(Trainer):
     def __init__(self, *args, eval_entropy_interval=100000, csv_dir=None, **kwargs):
@@ -69,9 +69,8 @@ class SilentEntropyTrainer(Trainer):
         
         # 核心计数器
         self.cumulative_entropy = 0.0
-        self.cumulative_qa = 0          # 已训练的 QA 总数
-        self.cumulative_tokens = 0      # 已训练的有效 Token 总数 (不含 padding)
-        
+        self.cumulative_qa = 0          
+        self.cumulative_tokens = 0      
         self.last_eval_at = 0.0
 
     def training_step(self, model, inputs, *args, **kwargs):
@@ -80,13 +79,8 @@ class SilentEntropyTrainer(Trainer):
         if batch_h is not None:
             self.cumulative_entropy += batch_h.sum().item()
         
-        # 2. 统计 QA 数量 (Batch Size)
+        # 2. 统计 QA 和 Token
         self.cumulative_qa += inputs["input_ids"].size(0)
-        
-        # 3. 统计有效 Token 数量
-        # labels 中 -100 代表 padding 或不需要计算 loss 的部分
-        # inputs["input_ids"] 中非 0 (pad_token_id) 的部分为有效 token
-        # 这里建议统计 input_ids 中非 pad 的数量，即实际喂入模型的 token 数
         valid_tokens = (inputs["input_ids"] != 0).sum().item()
         self.cumulative_tokens += valid_tokens
         
@@ -102,23 +96,66 @@ class SilentEntropyTrainer(Trainer):
         pass
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """
+        重写评估逻辑：不仅计算 Loss，还计算每个难度分片的 Token-level Accuracy
+        """
+        # A. 调用原生 evaluate 获取 Loss 字典
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
         
+        # B. 手动遍历所有评估集计算 Accuracy
+        self.model.eval()
+        shard_accuracies = {}
+
+        # self.eval_dataset 在 Trainer 中是一个字典 {'L2': Dataset, 'L3': Dataset, ...}
+        for shard_name, dataset in self.eval_dataset.items():
+            all_correct = 0
+            all_total = 0
+            
+            # 使用 Trainer 内部的 get_eval_dataloader 保证 batch 格式正确
+            eval_dataloader = self.get_eval_dataloader(dataset)
+            
+            for batch in eval_dataloader:
+                with torch.no_grad():
+                    # 前向传播
+                    inputs = self._prepare_inputs(batch)
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits # [Batch, Seq, Vocab]
+                    
+                    # 预测
+                    preds = torch.argmax(logits, dim=-1) # [Batch, Seq]
+                    labels = inputs["labels"] # [Batch, Seq]
+                    
+                    # 掩码：只关注答案部分 (labels != -100)
+                    mask = (labels != -100)
+                    
+                    # 计算匹配数量
+                    correct = (preds == labels) & mask
+                    all_correct += correct.sum().item()
+                    all_total += mask.sum().item()
+            
+            # 计算该分片的平均准确率
+            shard_accuracies[shard_name] = all_correct / all_total if all_total > 0 else 0.0
+
+        # C. 写入 CSV
         for key, value in metrics.items():
             if "loss" in key and key != f"{metric_key_prefix}_loss":
                 shard_name = key.replace(f"{metric_key_prefix}_", "").replace("_loss", "")
                 csv_path = os.path.join(self.csv_dir, f"{shard_name}.csv")
                 
-                # 在 DataFrame 中增加两列
+                acc_value = shard_accuracies.get(shard_name, 0.0)
+                
                 new_data = pd.DataFrame([{
                     "cumulative_entropy": self.cumulative_entropy,
-                    "cumulative_qa": self.cumulative_qa,         # 新增列
-                    "cumulative_tokens": self.cumulative_tokens, # 新增列
+                    "cumulative_qa": self.cumulative_qa,
+                    "cumulative_tokens": self.cumulative_tokens,
                     "eval_loss": value,
+                    "eval_accuracy": acc_value, # 新增准确率列
                     "eval_bits": value / np.log(2),
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }])
                 new_data.to_csv(csv_path, mode='a', index=False, header=not os.path.exists(csv_path))
+        
+        self.model.train() # 切回训练模式
         return metrics
 
 # ==========================================
