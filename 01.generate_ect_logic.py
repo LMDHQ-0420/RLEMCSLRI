@@ -45,7 +45,7 @@ def get_natural_entropy_level(num_edges, num_pre_samples=50):
 
 def generate_single_sample(vocab_size, num_edges, target_H):
     """生成符合目标逻辑熵的变长样本"""
-    all_vocab_nodes = list(range(vocab_size))
+    all_vocab_nodes = list(1, range(vocab_size))
     num_graph_nodes = max(5, int(num_edges * 0.3))
     while True:
         temp_G = nx.DiGraph()
@@ -141,7 +141,7 @@ def process_and_save_q_len(q_len, train_num, test_num, vocab_size, base_root, ch
     gc.collect()
 
 if __name__ == "__main__":
-    V_SIZE = 5000
+    V_SIZE = 2048
     Q_LEN_LIST = [30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
     TRAIN_COUNT = 1000000      # 100万
     TEST_COUNT = 50000        # 5万
