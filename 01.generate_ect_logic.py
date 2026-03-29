@@ -6,13 +6,17 @@ from datasets import Dataset
 from tqdm import tqdm
 import numpy as np
 import os
-import shutil
 import gc
+from collections import Counter
+from multiprocessing import Pool
 
-def get_natural_entropy_level(num_edges, num_pre_samples=50):
-    """探测当前结构下的最大逻辑熵天花板"""
+# ---------------- 探测与生成逻辑 ----------------
+
+def get_natural_stats(num_edges, num_pre_samples=100):
     max_entropies = []
+    path_lengths = []
     num_graph_nodes = max(5, int(num_edges * 0.3)) 
+    
     for _ in range(num_pre_samples):
         temp_G = nx.DiGraph()
         nodes = list(range(num_graph_nodes))
@@ -23,6 +27,7 @@ def get_natural_entropy_level(num_edges, num_pre_samples=50):
             if (u, v) not in edges:
                 edges.append((u, v))
                 temp_G.add_edge(u, v)
+        
         out_degrees = dict(temp_G.out_degree())
         graph_max_h = 0
         starts = [n for n in nodes if out_degrees.get(n, 0) > 0]
@@ -39,12 +44,14 @@ def get_natural_entropy_level(num_edges, num_pre_samples=50):
                             new_path = path.copy()
                             new_path.add(nbr)
                             queue.append((nbr, new_path, curr_h + step_h))
+                            path_lengths.append(len(new_path))
             if len(queue) > 300: break 
         max_entropies.append(graph_max_h)
-    return float(round(np.mean(max_entropies)))
+    
+    mode_len = Counter(path_lengths).most_common(1)[0][0] if path_lengths else 5
+    return float(round(np.mean(max_entropies))), mode_len
 
 def generate_single_sample(vocab_size, num_edges, target_H):
-    """生成符合目标逻辑熵的变长样本"""
     all_vocab_nodes = list(range(1, vocab_size))
     num_graph_nodes = max(5, int(num_edges * 0.3))
     while True:
@@ -81,76 +88,109 @@ def generate_single_sample(vocab_size, num_edges, target_H):
                             if nbr not in path:
                                 queue.append((nbr, path + [nbr], curr_h + step_h))
 
-def process_and_save_q_len(q_len, train_num, test_num, vocab_size, base_root, chunk_size=100000):
-    """
-    针对单个 Q_LEN 执行生成。
-    每达到 chunk_size 条数据即写入一个 parquet 文件并清空内存。
-    """
+def generate_random_sample(vocab_size, q_len, a_len):
+    all_tokens = list(range(1, vocab_size))
+    q_seq = random.choices(all_tokens, k=q_len)
+    a_seq = random.choices(all_tokens, k=a_len)
+    return q_seq, a_seq, 0.0
+
+# ---------------- 处理与落盘逻辑 ----------------
+
+def process_and_save(q_len, train_num, test_num, vocab_size, base_root, mode="logic", chunk_size=100000):
     num_edges = (q_len - 2) // 2
-    target_h = get_natural_entropy_level(num_edges)
+    target_h, mode_a_len = get_natural_stats(num_edges)
     
-    current_q_dir = f"{base_root}/Q_LEN_{q_len}_H_{int(target_h)}"
-    print(f"\n[任务启动] Q_LEN: {q_len} (Edges: {num_edges}) | 目标 H: {target_h}")
+    data_type = "ECT-Logic" if mode == "logic" else "ECT-Random"
+    current_dir = f"{base_root}/{data_type}/Q_LEN_{q_len}_H_{int(target_h)}"
     
-    # 记录已生成的 Question Hash，确保全局唯一（包括 Train 和 Test 之间也不重复）
+    # 路径检查：如果已存在则跳过
+    if os.path.exists(current_dir):
+        # 使用 print 而非 tqdm.write，因为子进程中 print 更直接
+        print(f"[SKIP] {mode.upper()} Q_LEN:{q_len} already exists.")
+        return
+
     seen_hashes = set()
     splits = {"train": train_num, "test": test_num}
     
     for split_name, total_count in splits.items():
-        save_path = os.path.join(current_q_dir, split_name)
+        save_path = os.path.join(current_dir, split_name)
         os.makedirs(save_path, exist_ok=True)
         
-        pbar = tqdm(total=total_count, desc=f"生成 {split_name}")
-        
-        collected_in_split = 0
+        collected = 0
         chunk_data = []
         part_idx = 1
         
-        while collected_in_split < total_count:
-            q_seq, a_seq, actual_h = generate_single_sample(vocab_size, num_edges, target_h)
+        while collected < total_count:
+            if mode == "logic":
+                q_seq, a_seq, actual_h = generate_single_sample(vocab_size, num_edges, target_h)
+            else:
+                q_seq, a_seq, actual_h = generate_random_sample(vocab_size, q_len, mode_a_len)
             
-            # 高效去重
             q_hash = hashlib.md5(np.array(q_seq, dtype=np.int32).tobytes()).digest()
             if q_hash not in seen_hashes:
                 seen_hashes.add(q_hash)
-                chunk_data.append({
-                    "question": q_seq,
-                    "answer": a_seq,
-                    "h": actual_h
-                })
-                collected_in_split += 1
-                pbar.update(1)
+                chunk_data.append({"question": q_seq, "answer": a_seq, "h": actual_h})
+                collected += 1
                 
-                # 分块存储逻辑
-                if len(chunk_data) >= chunk_size or collected_in_split == total_count:
-                    # 转换为 Dataset 并保存
-                    ds = Dataset.from_list(chunk_data)
-                    file_name = os.path.join(save_path, f"part_{part_idx}.parquet")
-                    ds.to_parquet(file_name)
+                # 到达 Chunk 大小，执行落盘
+                if len(chunk_data) >= chunk_size or collected == total_count:
+                    file_path = os.path.join(save_path, f"part_{part_idx}.parquet")
+                    Dataset.from_list(chunk_data).to_parquet(file_path)
                     
-                    # 释放内存
+                    # 优化后的控制台输出：仅在落盘时打印
+                    print(f"[SAVE] Mode: {mode.upper()} | Q_LEN: {q_len} | Split: {split_name} | Part: {part_idx} -> {file_path}")
+                    
                     chunk_data = []
-                    del ds
-                    gc.collect() # 显式触发垃圾回收
+                    gc.collect()
                     part_idx += 1
-                    
-        pbar.close()
-    
-    # 完成该 Q_LEN 后清空 Hash 表，节省内存迎接下一个 Q_LEN
     seen_hashes.clear()
-    gc.collect()
+# ---------------- 任务包装器 ----------------
+
+def worker_task(args):
+    ql, train_num, test_num, v_size, root_dir = args
+    real_ql = ql + 2
+    
+    # 1. 进程启动提示 (增加颜色或明显标识)
+    print(f"\n[PROCESS START] Handling Q_LEN: {real_ql} | PID: {os.getpid()}")
+    
+    # 2. 执行逻辑版生成
+    process_and_save(real_ql, train_num, test_num, v_size, root_dir, mode="logic")
+    
+    # 3. 执行随机版生成
+    process_and_save(real_ql, train_num, test_num, v_size, root_dir, mode="random")
+    
+    # 4. 进程结束提示
+    print(f"[PROCESS FINISH] Completed Q_LEN: {real_ql}\n")
+
+# ---------------- 主程序优化 ----------------
 
 if __name__ == "__main__":
     V_SIZE = 2048
+    # 保持 Q_LEN_LIST 不变
     Q_LEN_LIST = [30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
-    TRAIN_COUNT = 1000000      # 100万
-    TEST_COUNT = 50000        # 5万
-    CHUNK_SIZE = 100000       # 每10万条存储一次
+    TRAIN_COUNT = 1000000
+    TEST_COUNT = 50000
+    ROOT_DIR = "data"
+    NUM_PROCESSES = len(Q_LEN_LIST)
 
-    ROOT_DIR = "data/ECT-Logic"
+    task_args = [(ql, TRAIN_COUNT, TEST_COUNT, V_SIZE, ROOT_DIR) for ql in Q_LEN_LIST]
 
-    for ql in Q_LEN_LIST:
-        # ql + 2 传入函数，函数内部 (ql+2 - 2)//2 得到预期的边数
-        process_and_save_q_len(ql + 2, TRAIN_COUNT, TEST_COUNT, V_SIZE, ROOT_DIR, chunk_size=CHUNK_SIZE)
+    print("=" * 80)
+    print(f"Parallel Logic Data Generation System")
+    print(f"Processes: {NUM_PROCESSES} | Total Tasks: {len(task_args)}")
+    print(f"Root Directory: {ROOT_DIR}")
+    print("=" * 80)
+    
+    # 使用 imap_unordered 提高调度效率
+    with Pool(processes=NUM_PROCESSES) as pool:
+        # 主进度条
+        progress_bar = tqdm(total=len(task_args), desc="Overall Task Progress", unit="task")
+        
+        for _ in pool.imap_unordered(worker_task, task_args):
+            progress_bar.update(1)
+            
+        progress_bar.close()
 
-    print("\n[所有任务完成] 数据已分块保存在 data/ECT-Logic 目录下。")
+    print("=" * 80)
+    print("[SUCCESS] All logic and random data generation completed.")
+    print("=" * 80)
