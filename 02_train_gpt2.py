@@ -4,232 +4,211 @@ import torch
 import numpy as np
 import glob
 import pandas as pd
+import gc
 from datetime import datetime
-from datasets import load_from_disk, concatenate_datasets
-from transformers import (
-    GPT2Config, 
-    GPT2LMHeadModel, 
-    Trainer, 
-    TrainingArguments,
-    TrainerCallback
-)
+from datasets import load_dataset
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from transformers import GPT2Config, GPT2LMHeadModel
+from tqdm import tqdm
 
 # ==========================================
-# 1. 进度条增强：在 tqdm 上显示当前参数量规模
+# 1. 数据对齐函数 (保持不变)
 # ==========================================
-class ScaleInfoCallback(TrainerCallback):
-    def __init__(self, scale_name):
-        self.scale_name = scale_name
-
-    def on_step_end(self, args, state, control, **kwargs):
-        # 实时更新进度条描述，显示当前正在运行的实验规模
-        state.trial_name = f"Scale: {self.scale_name}"
-        return control
-
-# ==========================================
-# 2. 数据处理与 Tokenizer
-# ==========================================
-class LogicTokenizer:
-    def __init__(self, pad_token_id=0):
-        self.pad_token_id = pad_token_id
-        self.eos_token_id = pad_token_id
-        self.padding_side = "right"
-
-    def pad(self, features, **kwargs):
-        input_ids = [feature["input_ids"] for feature in features]
-        labels = [feature["labels"] for feature in features]
-        curr_max_len = max(len(x) for x in input_ids)
-        
-        batch_input_ids, batch_labels = [], []
-        for ids, lbls in zip(input_ids, labels):
-            pad_len = curr_max_len - len(ids)
-            batch_input_ids.append(torch.tensor(ids + [self.pad_token_id] * pad_len))
-            batch_labels.append(torch.tensor(lbls + [-100] * pad_len))
-
-        batch = {"input_ids": torch.stack(batch_input_ids), "labels": torch.stack(batch_labels)}
-        if "h" in features[0]:
-            batch["h"] = torch.tensor([f["h"] for f in features])
-        return batch
-
-def preprocess_function(examples):
-    inputs, labels = [], []
-    for q, a in zip(examples["q"], examples["a"]):
-        inputs.append(q + a)
-        labels.append([-100] * len(q) + a)
-    return {"input_ids": inputs, "labels": labels, "h": examples["h"]}
+def logic_data_collator(batch, pad_token_id=0):
+    input_ids, labels, h_values, a_lens = [], [], [], []
+    for item in batch:
+        q, a = item["question"], item["answer"]
+        input_ids.append(torch.tensor(q + a))
+        labels.append(torch.tensor([-100] * len(q) + a))
+        h_values.append(item.get("h", 0.0))
+        a_lens.append(len(a))
+    max_len = max(len(x) for x in input_ids)
+    padded_ids = torch.stack([torch.cat([ids, torch.full((max_len - len(ids),), pad_token_id)]) for ids in input_ids])
+    padded_labels = torch.stack([torch.cat([lbls, torch.full((max_len - len(lbls),), -100)]) for lbls in labels])
+    return {
+        "input_ids": padded_ids, 
+        "labels": padded_labels, 
+        "h": torch.tensor(h_values, dtype=torch.float32),
+        "a_lens": torch.tensor(a_lens, dtype=torch.int32)
+    }
 
 # ==========================================
-# 3. 自定义 Trainer：增加 Acc、QA 和 Token 计数
+# 2. 核心实验执行函数 (非累积式，每次 N 重新训练)
 # ==========================================
-class SilentEntropyTrainer(Trainer):
-    def __init__(self, *args, eval_entropy_interval=100000, csv_dir=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.eval_entropy_interval = eval_entropy_interval
-        self.csv_dir = csv_dir
-        
-        # 核心计数器
-        self.cumulative_entropy = 0.0
-        self.cumulative_qa = 0          
-        self.cumulative_tokens = 0      
-        self.last_eval_at = 0.0
+def run_convergence_experiment(
+    config_data, # 传入配置以便重新初始化模型
+    global_settings,
+    dataloader,
+    device,
+    search_log_path,
+    model_save_path,
+    target_acc=1.0,
+    max_inner_epochs=10000,
+    loss_plateau_min_delta=1e-6,
+    loss_plateau_patience=100, # 独立训练难度大，建议增加耐心值
+):
+    total_qa_count = 0      
+    saturation_stats = None
+    first_saturation_found = False
 
-    def training_step(self, model, inputs, *args, **kwargs):
-        # 1. 统计逻辑熵
-        batch_h = inputs.pop("h", None)
-        if batch_h is not None:
-            self.cumulative_entropy += batch_h.sum().item()
-        
-        # 2. 统计 QA 和 Token
-        self.cumulative_qa += inputs["input_ids"].size(0)
-        valid_tokens = (inputs["input_ids"] != 0).sum().item()
-        self.cumulative_tokens += valid_tokens
-        
-        loss = super().training_step(model, inputs, *args, **kwargs)
-        
-        # 检查是否达到评估间隔
-        if self.cumulative_entropy - self.last_eval_at >= self.eval_entropy_interval:
-            self.evaluate()
-            self.last_eval_at = self.cumulative_entropy
-        return loss
+    if os.path.exists(search_log_path): os.remove(search_log_path)
+    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
 
-    def log(self, logs):
-        pass
+    # 这里的 current_pool 会不断变大，但我们每次都重开模型训练整个 pool
+    current_pool = []
 
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """
-        重写评估逻辑：不仅计算 Loss，还计算每个难度分片的 Token-level Accuracy
-        """
-        # A. 调用原生 evaluate 获取 Loss 字典
-        metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+    for batch in tqdm(dataloader, desc="  Increasing N", leave=False):
+        current_pool.append(batch)
+        total_qa_count += batch["input_ids"].size(0)
         
-        # B. 手动遍历所有评估集计算 Accuracy
-        self.model.eval()
-        shard_accuracies = {}
+        # --- 核心修改：针对当前的 total_qa_count，重新初始化模型 ---
+        model_config = GPT2Config(vocab_size=global_settings["vocab_size"], **config_data)
+        model = GPT2LMHeadModel(model_config).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=5e-4)
+        
+        model.train()
+        converged = False
+        best_loss = float("inf")
+        no_improve_count = 0
+        last_metrics = {}
 
-        # self.eval_dataset 在 Trainer 中是一个字典 {'L2': Dataset, 'L3': Dataset, ...}
-        for shard_name, dataset in self.eval_dataset.items():
-            all_correct = 0
-            all_total = 0
+        # 内部训练循环
+        for inner_epoch in range(max_inner_epochs):
+            epoch_correct = 0
+            epoch_total = 0
+            epoch_loss_sum = 0.0
+            epoch_loss_steps = 0
             
-            # 使用 Trainer 内部的 get_eval_dataloader 保证 batch 格式正确
-            eval_dataloader = self.get_eval_dataloader(dataset)
-            
-            for batch in eval_dataloader:
+            # 训练当前 Pool 里的所有数据
+            for train_step in current_pool:
+                input_ids = train_step["input_ids"].to(device)
+                labels = train_step["labels"].to(device)
+                
+                outputs = model(input_ids=input_ids, labels=labels)
+                loss = outputs.loss 
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                epoch_loss_sum += loss.item()
+                epoch_loss_steps += 1
+
                 with torch.no_grad():
-                    # 前向传播
-                    inputs = self._prepare_inputs(batch)
-                    outputs = self.model(**inputs)
-                    logits = outputs.logits # [Batch, Seq, Vocab]
-                    
-                    # 预测
-                    preds = torch.argmax(logits, dim=-1) # [Batch, Seq]
-                    labels = inputs["labels"] # [Batch, Seq]
-                    
-                    # 掩码：只关注答案部分 (labels != -100)
-                    mask = (labels != -100)
-                    
-                    # 计算匹配数量
-                    correct = (preds == labels) & mask
-                    all_correct += correct.sum().item()
-                    all_total += mask.sum().item()
+                    shift_logits = outputs.logits[:, :-1, :]
+                    shift_labels = labels[:, 1:]
+                    answer_mask = (shift_labels != -100)
+                    preds = torch.argmax(shift_logits, dim=-1)
+                    token_correct = (preds == shift_labels) | (~answer_mask)
+                    seq_correct = token_correct.all(dim=1).sum().item()
+                    epoch_correct += seq_correct
+                    epoch_total += input_ids.size(0)
+
+            current_loss = epoch_loss_sum / epoch_loss_steps
+            current_acc = epoch_correct / epoch_total
+
+            last_metrics = {
+                "n": total_qa_count,
+                "inner_epoch": inner_epoch,
+                "loss": current_loss,
+                "acc": current_acc,
+                "timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+
+            if (best_loss - current_loss) > loss_plateau_min_delta:
+                best_loss = current_loss
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
             
-            # 计算该分片的平均准确率
-            shard_accuracies[shard_name] = all_correct / all_total if all_total > 0 else 0.0
-
-        # C. 写入 CSV
-        for key, value in metrics.items():
-            if "loss" in key and key != f"{metric_key_prefix}_loss":
-                shard_name = key.replace(f"{metric_key_prefix}_", "").replace("_loss", "")
-                csv_path = os.path.join(self.csv_dir, f"{shard_name}.csv")
-                
-                acc_value = shard_accuracies.get(shard_name, 0.0)
-                
-                new_data = pd.DataFrame([{
-                    "cumulative_entropy": self.cumulative_entropy,
-                    "cumulative_qa": self.cumulative_qa,
-                    "cumulative_tokens": self.cumulative_tokens,
-                    "eval_loss": value,
-                    "eval_accuracy": acc_value, # 新增准确率列
-                    "eval_bits": value / np.log(2),
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }])
-                new_data.to_csv(csv_path, mode='a', index=False, header=not os.path.exists(csv_path))
+            if current_acc >= target_acc:
+                converged = True
+                break
+            
+            # 如果在当前 N 下无法收敛，提前终止此轮 N 的训练
+            if no_improve_count >= loss_plateau_patience:
+                tqdm.write(f"    [FAIL] N={total_qa_count} could not converge. Moving to next N.")
+                break
         
-        self.model.train() # 切回训练模式
-        return metrics
+        # 记录该 N 阶段的最终结果
+        if last_metrics:
+            pd.DataFrame([last_metrics]).to_csv(search_log_path, mode='a', index=False, header=not os.path.exists(search_log_path))
+        
+        # 只有在收敛的情况下，才考虑保存第一个饱和点模型
+        if converged and not first_saturation_found:
+            first_saturation_found = True
+            model.save_pretrained(model_save_path)
+            tqdm.write(f"    [SATURATION] N={total_qa_count} reached 100% Acc.")
+            
+            temp_tokens = sum(b["a_lens"].sum().item() for b in current_pool)
+            temp_h = sum(b["h"].sum().item() for b in current_pool)
+            saturation_stats = {
+                "n": total_qa_count,
+                "tokens": temp_tokens,
+                "nll_bits": (current_loss * temp_tokens) / np.log(2),
+                "h_bits": temp_h
+            }
+        
+        # 必须显式清理内存，因为每一轮 N 都开了新模型
+        del model; del optimizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    return saturation_stats if saturation_stats else {"n": total_qa_count, "tokens": 0, "nll_bits": 0, "h_bits": 0}
 
 # ==========================================
-# 4. 运行主函数
+# 3. 主程序逻辑 (适配非累积函数调用)
 # ==========================================
-def run_experiment():
-    DATA_ROOT = "data/ECT-Logic"
-    REGISTRY_FILE = "GPT2_Scaling_Logic_Registry.json"
-    EXPERIMENT_TIME = datetime.now().strftime("%Y%m%d_%H%M%S")
+def main():
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    CONFIG_PATH = "gpt2_reg.json"
+    DATA_ROOT = "data"
+    OUTPUT_BASE = "outputs"
     
-    with open(REGISTRY_FILE, "r") as f:
+    with open(CONFIG_PATH, "r") as f:
         reg = json.load(f)
     
     configs = reg["gpt2_scaling_configs"]
     global_settings = reg["global_settings"]
-
-    # 1. 加载训练集
-    train_paths = sorted(glob.glob(os.path.join(DATA_ROOT, "train/hf_shards/shard_*")))
-    train_ds = concatenate_datasets([load_from_disk(p) for p in train_paths]).map(
-        preprocess_function, batched=True, remove_columns=["q", "a"]
-    )
-
-    # 2. 遍历加载所有连续的 L 难度 (2-25)
-    eval_datasets = {}
-    print(">>> 正在初始化测试集 (L2 - L25)...")
-    for l_val in range(2, 26): # 包含 2 到 25
-        path = os.path.join(DATA_ROOT, f"test/hf_shards/shard_L{l_val}")
-        if os.path.exists(path):
-            eval_datasets[f"L{l_val}"] = load_from_disk(path).map(
-                preprocess_function, batched=True, remove_columns=["q", "a"]
-            )
-
-    logic_tokenizer = LogicTokenizer(pad_token_id=0)
-
-    # 3. 循环实验
+    
     for scale_name, cfg_data in configs.items():
-        exp_dir = f"output/{EXPERIMENT_TIME}/{scale_name}"
-        os.makedirs(exp_dir, exist_ok=True)
-
-        config = GPT2Config(vocab_size=global_settings["vocab_size"], **cfg_data, use_cache=False)
-        model = GPT2LMHeadModel(config)
-
-        training_args = TrainingArguments(
-            output_dir=exp_dir,
-            num_train_epochs=1,
-            per_device_train_batch_size=64,
-            learning_rate=5e-4,
-            lr_scheduler_type="cosine",
-            eval_strategy="no",
-            save_strategy="no",
-            logging_steps=9999999,      # 彻底屏蔽标准日志
-            report_to="none",
-            disable_tqdm=False,        # 仅保留 TQDM
-            fp16=torch.cuda.is_available(),
-            remove_unused_columns=False
-        )
-
-        trainer = SilentEntropyTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=eval_datasets,
-            data_collator=logic_tokenizer.pad,
-            eval_entropy_interval=100000,
-            csv_dir=exp_dir,
-            callbacks=[ScaleInfoCallback(scale_name)] # 添加参数量显示回调
-        )
-
-        trainer.train()
-        trainer.evaluate() # 最终评估
+        save_dir = os.path.join(OUTPUT_BASE, f"GPT2_{scale_name}")
+        search_dir = os.path.join(save_dir, "search_saturation")
+        model_base_dir = os.path.join(save_dir, "models")
+        os.makedirs(search_dir, exist_ok=True)
         
-        # 释放显存
-        del model, trainer
-        torch.cuda.empty_cache()
+        q_len_dirs = sorted(glob.glob(os.path.join(DATA_ROOT, "ECT-Logic", "Q_LEN_*")), 
+                            key=lambda x: int(os.path.basename(x).split("_")[2]))
+
+        for q_dir in q_len_dirs:
+            q_len = int(os.path.basename(q_dir).split("_")[2])
+            
+            # --- Random 实验 ---
+            rand_train_files = glob.glob(os.path.join(DATA_ROOT, "ECT-Random", f"Q_LEN_{q_len}", "train/*.parquet"))
+            if rand_train_files:
+                loader = DataLoader(load_dataset("parquet", data_files=rand_train_files, split="train"), 
+                                   batch_size=32, shuffle=True, collate_fn=logic_data_collator)
+                log_p = os.path.join(search_dir, f"random_qlen_{q_len}_process.csv")
+                model_p = os.path.join(model_base_dir, f"random_qlen_{q_len}")
+                
+                # 传入配置参数，内部会重新初始化模型
+                res = run_convergence_experiment(cfg_data, global_settings, loader, DEVICE, log_p, model_p)
+                
+                pd.DataFrame([{"q_len": q_len, "saturation_n": res["n"], "nll_bits": res["nll_bits"]}]).to_csv(
+                    os.path.join(save_dir, "random_results.csv"), mode='a', index=False, header=not os.path.exists(os.path.join(save_dir, "random_results.csv")))
+
+            # --- Logic 实验 ---
+            logic_train_files = glob.glob(os.path.join(q_dir, "train/*.parquet"))
+            if logic_train_files:
+                loader = DataLoader(load_dataset("parquet", data_files=logic_train_files, split="train"), 
+                                   batch_size=32, shuffle=True, collate_fn=logic_data_collator)
+                log_p = os.path.join(search_dir, f"logic_qlen_{q_len}_process.csv")
+                model_p = os.path.join(model_base_dir, f"logic_qlen_{q_len}")
+                
+                res = run_convergence_experiment(cfg_data, global_settings, loader, DEVICE, log_p, model_p)
+                
+                pd.DataFrame([{"q_len": q_len, "saturation_n": res["n"], "nll_bits": res["nll_bits"], "h_bits": res["h_bits"]}]).to_csv(
+                    os.path.join(save_dir, "logic_results.csv"), mode='a', index=False, header=not os.path.exists(os.path.join(save_dir, "logic_results.csv")))
 
 if __name__ == "__main__":
-    run_experiment()
+    main()

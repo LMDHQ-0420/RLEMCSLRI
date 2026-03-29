@@ -100,8 +100,12 @@ def process_and_save(q_len, train_num, test_num, vocab_size, base_root, mode="lo
     num_edges = (q_len - 2) // 2
     target_h, mode_a_len = get_natural_stats(num_edges)
     
-    data_type = "ECT-Logic" if mode == "logic" else "ECT-Random"
-    current_dir = f"{base_root}/{data_type}/Q_LEN_{q_len}_H_{int(target_h)}"
+    if mode == "logic":
+        data_type = "ECT-Logic"
+        current_dir = f"{base_root}/{data_type}/Q_LEN_{q_len}_H_{int(target_h)}"
+    else:
+        data_type = "ECT-Random"
+        current_dir = f"{base_root}/{data_type}/Q_LEN_{q_len}"
     
     # 路径检查：如果已存在则跳过
     if os.path.exists(current_dir):
